@@ -740,8 +740,9 @@ passes.
 An aggregated cell used to look exactly like a cell that simply has that text in
 it. Nothing said the zoom was hiding anything, so the only way to find out was
 to zoom in and look. `cell_gather` therefore also reports `extra`: how many
-contributing entries are **not at the display level**, drawn as a small dim
-number in the cell's left margin.
+contributing entries **carry text at some level other than the display one**,
+drawn as a small dim number in the cell's left margin. It counts writing, not
+cells — see the edit stack below for why colour-only entries are left out.
 
 At most one entry can sit at the display level — same level and same bucket
 means the same entry — so `extra` is exactly "everything beyond the cell's own
@@ -766,10 +767,56 @@ for it. The edit box now opens the neighbourhood out around itself: everything
 else in that span at another level, **coarser above, finer below**, each strip
 naming its level so the shape is readable at a glance.
 
-They are read-only and drawn in the edit colour with a plain outline — this is a
-look, not a second edit. The entries come out of `entry_cmp` order, so each side
-reads in time order. A side that runs out of window simply stops rather than
-drawing off the edge; the count in the cell is still the honest total.
+They are read-only — this is a look, not a second edit. The entries come out of
+`entry_cmp` order, so each side reads in time order. A side that runs out of
+window simply stops rather than drawing off the edge; the count in the cell is
+still the honest total.
+
+**`edit_stack_gather` decides what is in the stack, and it must stay the same
+predicate as the `extra` count in `cell_gather`.** That is not tidiness — the
+count drawn in the cell is a promise about what opens out of it, and every bug
+this feature has had came from the two disagreeing. It cost two rounds:
+
+1. The draw pass required text but the count did not, so an hour marked red and
+   never written in was counted and then silently dropped. What popped down
+   first was the *next* entry along, in whatever colour that one happened to
+   be — which reads exactly like a strip failing to inherit its colour.
+2. Taking colour-only entries in *both* places fixed the mismatch and produced
+   a worse artifact: a shift-coloured block's earliest hour has no writing in
+   it, so it sorts first and opens as an empty band at the top of the stack.
+
+The settled predicate is **entries with text, at another level**. A colour-only
+entry has nothing to open out, and what it contributes is already in the cell's
+own fill, so a count pointing at it sends you looking for writing that was never
+there. Its colour still reaches the cell through `cell_gather` — only the count
+and the stack skip it, and there is a test for exactly that.
+
+The cost of this reading, stated plainly: a cell that is red *purely* because of
+a colour-only entry at another resolution shows no count and no strip, so
+nothing on screen says where the red came from. That was judged better than a
+band with nothing in it. If it needs answering, the answer is a distinct
+affordance — a marker, not a row in the stack.
+
+Two tests hold the two functions to the same predicate; if one gains a
+condition, so must the other.
+
+The split is the same one as `cell_gather`/`cell_text`: choosing what to show
+takes no measurement and no geometry, so it is testable without an X connection,
+and fitting the strips into the window stays in the draw pass.
+
+Each strip keeps **the colour it has on its own timeframe** (`COL_WRITTEN +
+e->color`), not the edit colour. The group then reads as the cells it is
+actually made of, and `edit` is left meaning one thing only: the cell you are
+typing into, which is now the odd one out in the stack rather than one of a
+uniform block. A `line` rule sits above each strip so two of the same colour
+still read as two cells.
+
+The **selection border goes around the whole group**, once, rather than around
+each cell: what is selected is the span, and the strips are that same span at
+other resolutions. It is drawn last, after the loop has settled how far the
+group reaches, and it degenerates to exactly the old single-cell outline when
+`above` and `below` are both zero — which is why there is no separate case for
+a cell with nothing else in it.
 
 This is why the whole edit-box block now draws **after** the grid's clip
 rectangle is released, and after the row names, rather than in the middle of the
@@ -981,7 +1028,12 @@ being clamped, and the sliders staying clear at `MAX_ROWS`. The cell aggregate
 too: red and blue voting to mixed while all-blue still votes blue, mixed landing
 on its own palette slot, the alt-click cycle staying inside the three storable
 colours, and `extra` counting finer and coarser entries while never counting the
-cell's own. The themes column
+cell's own, and a colour-only entry going uncounted while still colouring the
+cell. The edit stack too, against the same fixtures: no empty strip at the top
+of it, the stack count equalling the cell's
+`extra` in every case, the edited cell's own entry staying out of its own stack,
+a neighbouring day's entry staying out while a month entry reaching into the day
+stays in, and a lone cell having an empty stack. The themes column
 too: the panel's height not moving with the theme count, the column clearing the
 picker and starting level with its top, items running down it and wrapping into
 the next one, every item landing inside the window, the hit test finding the item

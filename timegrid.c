@@ -1359,11 +1359,16 @@ selection_set_color(struct grid *g)
  * CELL_MIXED, a colour of its own. They used to cancel to the plain "written"
  * shade, which lost the fact that anything chromatic was there at all.
  *
- * `extra` counts entries at any level but `level` — the ones whose writing you
- * cannot fully see here, because they were aggregated into this cell from finer
- * ones or expanded into it from a coarser one. At most one entry can sit at the
- * display level (same level and same bucket means the same entry), so this is
- * also "everything beyond the cell's own content".
+ * `extra` counts entries at any level but `level` that have **text** — the
+ * writing you cannot fully see here, because it was aggregated into this cell
+ * from finer ones or expanded into it from a coarser one. At most one entry can
+ * sit at the display level (same level and same bucket means the same entry),
+ * so this is also "all the writing beyond the cell's own".
+ *
+ * A colour-only entry is deliberately not counted. It has nothing to show, and
+ * what it contributes — its colour — is already in the cell's own fill, so a
+ * count pointing at it sends you looking for writing that was never there.
+ * edit_stack_gather skips them for the same reason and must keep agreeing.
  *
  * Deliberately does no text measurement, so the whole aggregate/expand model
  * is testable without an X connection. Fitting is cell_text's job. */
@@ -1390,7 +1395,7 @@ cell_gather(struct grid *g, int row, time_t t, time_t t_next, int level,
 			continue;   /* span does not reach this cell */
 		}
 		*filled = 1;
-		if (e->level != level) {
+		if (e->level != level && e->text[0] != '\0') {
 			(*extra)++;
 		}
 		if (e->color == CELL_RED) {
@@ -1413,6 +1418,48 @@ cell_gather(struct grid *g, int row, time_t t, time_t t_next, int level,
 		*color = CELL_RED;
 	} else if (has_blue) {
 		*color = CELL_BLUE;
+	}
+	return count;
+}
+
+/* Everything else inside one cell's span that was written at some other
+ * resolution — what the edit box opens out around itself, and exactly what
+ * cell_gather counted as `extra`.
+ *
+ * The same overlap test as cell_gather, and it must keep the same acceptance,
+ * because the count drawn in the cell is a promise about what opens out of it.
+ * Getting that wrong has cost two rounds already: requiring text here but not
+ * there dropped a strip the count had promised, and taking colour-only entries
+ * in both places put an empty band at the top of the stack — the earliest hour
+ * of a shift-coloured block has no writing in it, so it sorts first and shows
+ * nothing. Neither reads as a cell; both read as a bug.
+ *
+ * So: **entries with text, at another level.** A colour-only entry has nothing
+ * to open out, and its colour is already in the cell's fill. Two tests hold the
+ * two functions to the same predicate; if one gains a condition, so must the
+ * other.
+ *
+ * No measurement and no geometry, so the choice of what to show is testable
+ * without an X connection. Fitting the strips into the window is the draw
+ * pass's job, the same split as cell_gather and cell_text. */
+static int
+edit_stack_gather(struct grid *g, int row, int level, time_t start,
+                  const struct entry *out[], int max)
+{
+	time_t span_end = bucket_step(start, level, +1);
+	int i, count = 0;
+
+	for (i = 0; i < g->entry_count && count < max; i++) {
+		const struct entry *e = &g->entries[i];
+
+		if (e->row != row || e->level == level || e->text[0] == '\0') {
+			continue;
+		}
+		if (bucket_step(e->start, e->level, +1) <= start ||
+		    e->start >= span_end) {
+			continue;
+		}
+		out[count++] = e;
 	}
 	return count;
 }
@@ -1937,12 +1984,12 @@ redraw(struct grid *g)
 		XGlyphInfo ext;
 		int cy = g->margin_top + g->context_h +
 		         g->row_h * (row_visible_index(g, g->edit_row) + 1);
-		int box_x, box_w, i, above = 0, below = 0;
+		const struct entry *stack[MAX_PIECES];
+		int box_x, box_w, i, above = 0, below = 0, stack_n;
 		int top_limit = g->margin_top + g->context_h + g->row_h;
-		time_t span_end = bucket_step(g->edit_start, g->edit_level, +1);
 
 		x = pixel_at_time(g, (double)g->edit_start);
-		nx = pixel_at_time(g, (double)span_end);
+		nx = pixel_at_time(g, (double)bucket_step(g->edit_start, g->edit_level, +1));
 		XftTextExtentsUtf8(g->dpy, font_for(g, COL_FG), (FcChar8 *)g->input,
 		                   g->input_len, &ext);
 		box_x = (int)x + 1;
@@ -1963,24 +2010,21 @@ redraw(struct grid *g)
 		 * while being edited, so the rest of what was in there could only be
 		 * found by abandoning the edit and zooming in to hunt for it.
 		 *
-		 * Read-only, and drawn dim: this is a look at the neighbourhood, not a
-		 * second edit. Ordered by entry_cmp, so each side reads in time order.
+		 * Each keeps the colour it has on its own timeframe rather than the
+		 * edit colour, so the group reads as the cells it is made of and the
+		 * one being typed into is the odd one out. Read-only all the same:
+		 * this is a look at the neighbourhood, not a second edit. Ordered by
+		 * entry_cmp, so each side reads in time order.
 		 *
 		 * A side that runs out of window simply stops. The count in the cell
 		 * is the honest total, and it is still there underneath the box. */
-		for (i = 0; i < g->entry_count; i++) {
-			const struct entry *e = &g->entries[i];
+		stack_n = edit_stack_gather(g, g->edit_row, g->edit_level,
+		                            g->edit_start, stack, MAX_PIECES);
+		for (i = 0; i < stack_n; i++) {
+			const struct entry *e = stack[i];
 			int sy, lw;
 			XGlyphInfo lext;
 
-			if (e->row != g->edit_row || e->level == g->edit_level ||
-			    e->text[0] == '\0') {
-				continue;
-			}
-			if (bucket_step(e->start, e->level, +1) <= g->edit_start ||
-			    e->start >= span_end) {
-				continue;
-			}
 			if (e->level > g->edit_level) {
 				sy = cy - g->row_h * (above + 1);
 				if (sy < top_limit) {
@@ -1994,10 +2038,12 @@ redraw(struct grid *g)
 				}
 				below++;
 			}
-			XSetForeground(g->dpy, g->gc, g->col[COL_EDIT].pixel);
+			XSetForeground(g->dpy, g->gc, g->col[COL_WRITTEN + e->color].pixel);
 			XFillRectangle(g->dpy, g->buf, g->gc, box_x, sy + 1, box_w, g->row_h - 1);
+			/* A rule between the strips, so two of the same colour still read
+			 * as two cells. */
 			XSetForeground(g->dpy, g->gc, g->col[COL_LINE].pixel);
-			XDrawRectangle(g->dpy, g->buf, g->gc, box_x, sy + 1, box_w - 1, g->row_h - 2);
+			XDrawLine(g->dpy, g->buf, g->gc, box_x, sy, box_x + box_w - 1, sy);
 			/* The level is named because it is the whole point of the strip:
 			 * "there is an hour's worth of writing inside this day". */
 			XftTextExtentsUtf8(g->dpy, font_for(g, COL_DIM),
@@ -2012,15 +2058,24 @@ redraw(struct grid *g)
 
 		XSetForeground(g->dpy, g->gc, g->col[COL_EDIT].pixel);
 		XFillRectangle(g->dpy, g->buf, g->gc, box_x, cy + 1, box_w, g->row_h - 1);
-		/* Outlined because it can now cover its neighbours — without an edge
-		 * there is nothing to say where the box being typed into ends. */
-		XSetForeground(g->dpy, g->gc, g->col[COL_SELECT].pixel);
-		XDrawRectangle(g->dpy, g->buf, g->gc, box_x, cy + 1, box_w - 1, g->row_h - 2);
+		if (above > 0) {
+			XSetForeground(g->dpy, g->gc, g->col[COL_LINE].pixel);
+			XDrawLine(g->dpy, g->buf, g->gc, box_x, cy, box_x + box_w - 1, cy);
+		}
 		draw_text(g, box_x + g->pad_x, cy + (g->row_h - g->font->height) / 2,
 		          box_w - g->pad_x * 2, COL_FG, g->input);
 		XSetForeground(g->dpy, g->gc, g->col[COL_NOW_EDGE].pixel);
 		XFillRectangle(g->dpy, g->buf, g->gc, box_x + g->pad_x + ext.xOff + 1,
 		               cy + 4, 1, g->row_h - 8);
+
+		/* One selection border around the whole group, not one per cell: what
+		 * is selected is the span, and the strips are the same span at other
+		 * resolutions. Drawn last, once the loop above has settled how far the
+		 * group reaches, and it degenerates to exactly the old single-cell
+		 * outline when there is nothing else in the span. */
+		XSetForeground(g->dpy, g->gc, g->col[COL_SELECT].pixel);
+		XDrawRectangle(g->dpy, g->buf, g->gc, box_x, cy - g->row_h * above + 1,
+		               box_w - 1, g->row_h * (above + below + 1) - 2);
 	}
 
 	/* The "+" row sits below the grid proper — no columns run through it, so
