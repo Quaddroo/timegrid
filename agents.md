@@ -811,6 +811,19 @@ typing into, which is now the odd one out in the stack rather than one of a
 uniform block. A `line` rule sits above each strip so two of the same colour
 still read as two cells.
 
+**One width for the whole group**, taken from the widest of the cell, of what is
+being typed, and of every strip's `level name + text`. The reason the edit box
+grows at all — editing is the one moment the whole text has to be legible
+whatever the zoom — applies just as much to the strips, which are the same
+words at another resolution. Giving each strip its own width was the other
+option and is wrong here: they sit under a single selection border, and a ragged
+stack inside a bounding rectangle reads as a drawing bug rather than as a set of
+cells.
+
+That means a sizing pass over the stack before `box_x` is clamped. It keeps each
+strip's level-name width in `stack_lw`, so the draw loop measures nothing —
+which also removed the per-strip `XftTextExtentsUtf8` that pass used to repeat.
+
 The **selection border goes around the whole group**, once, rather than around
 each cell: what is selected is the span, and the strips are that same span at
 other resolutions. It is drawn last, after the loop has settled how far the

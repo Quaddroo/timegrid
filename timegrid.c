@@ -1985,24 +1985,9 @@ redraw(struct grid *g)
 		int cy = g->margin_top + g->context_h +
 		         g->row_h * (row_visible_index(g, g->edit_row) + 1);
 		const struct entry *stack[MAX_PIECES];
+		int stack_lw[MAX_PIECES];
 		int box_x, box_w, i, above = 0, below = 0, stack_n;
 		int top_limit = g->margin_top + g->context_h + g->row_h;
-
-		x = pixel_at_time(g, (double)g->edit_start);
-		nx = pixel_at_time(g, (double)bucket_step(g->edit_start, g->edit_level, +1));
-		XftTextExtentsUtf8(g->dpy, font_for(g, COL_FG), (FcChar8 *)g->input,
-		                   g->input_len, &ext);
-		box_x = (int)x + 1;
-		box_w = (int)(nx - x) - 1;
-		if (ext.xOff + g->pad_x * 2 + 2 > box_w) {
-			box_w = ext.xOff + g->pad_x * 2 + 2;
-		}
-		if (box_x + box_w > g->w) {
-			box_x = g->w - box_w;
-		}
-		if (box_x < g->gutter_w) {
-			box_x = g->gutter_w;
-		}
 
 		/* Everything else written inside this cell's span, at some other
 		 * resolution, opened out around the box: coarser above, finer below.
@@ -2020,10 +2005,54 @@ redraw(struct grid *g)
 		 * is the honest total, and it is still there underneath the box. */
 		stack_n = edit_stack_gather(g, g->edit_row, g->edit_level,
 		                            g->edit_start, stack, MAX_PIECES);
+
+		x = pixel_at_time(g, (double)g->edit_start);
+		nx = pixel_at_time(g, (double)bucket_step(g->edit_start, g->edit_level, +1));
+		XftTextExtentsUtf8(g->dpy, font_for(g, COL_FG), (FcChar8 *)g->input,
+		                   g->input_len, &ext);
+		box_x = (int)x + 1;
+
+		/* The widest of the cell, of what is being typed, and of every strip.
+		 * The reason the box grows at all — this is the one moment the whole
+		 * text has to be legible, whatever the zoom — applies just as much to
+		 * the strips, which are the same words at another resolution.
+		 *
+		 * One width for the group rather than one per strip: they sit under a
+		 * single selection border, and a ragged stack inside a bounding
+		 * rectangle reads as a drawing bug rather than as a set of cells.
+		 *
+		 * The level-name widths are kept from this pass, so the draw loop below
+		 * measures nothing. */
+		box_w = (int)(nx - x) - 1;
+		if (ext.xOff + g->pad_x * 2 + 2 > box_w) {
+			box_w = ext.xOff + g->pad_x * 2 + 2;
+		}
+		for (i = 0; i < stack_n; i++) {
+			const char *lvl = level_names[stack[i]->level];
+			XGlyphInfo lext, text_ext;
+			int need;
+
+			XftTextExtentsUtf8(g->dpy, font_for(g, COL_DIM), (FcChar8 *)lvl,
+			                   (int)strlen(lvl), &lext);
+			XftTextExtentsUtf8(g->dpy, font_for(g, COL_FG),
+			                   (FcChar8 *)stack[i]->text,
+			                   (int)strlen(stack[i]->text), &text_ext);
+			stack_lw[i] = lext.xOff + g->pad_x;
+			need = g->pad_x + stack_lw[i] + text_ext.xOff + g->pad_x + 2;
+			if (need > box_w) {
+				box_w = need;
+			}
+		}
+		if (box_x + box_w > g->w) {
+			box_x = g->w - box_w;
+		}
+		if (box_x < g->gutter_w) {
+			box_x = g->gutter_w;
+		}
+
 		for (i = 0; i < stack_n; i++) {
 			const struct entry *e = stack[i];
-			int sy, lw;
-			XGlyphInfo lext;
+			int sy, lw = stack_lw[i];
 
 			if (e->level > g->edit_level) {
 				sy = cy - g->row_h * (above + 1);
@@ -2046,10 +2075,6 @@ redraw(struct grid *g)
 			XDrawLine(g->dpy, g->buf, g->gc, box_x, sy, box_x + box_w - 1, sy);
 			/* The level is named because it is the whole point of the strip:
 			 * "there is an hour's worth of writing inside this day". */
-			XftTextExtentsUtf8(g->dpy, font_for(g, COL_DIM),
-			                   (FcChar8 *)level_names[e->level],
-			                   (int)strlen(level_names[e->level]), &lext);
-			lw = lext.xOff + g->pad_x;
 			draw_text(g, box_x + g->pad_x, sy + (g->row_h - g->font->height) / 2,
 			          box_w - g->pad_x * 2, COL_DIM, level_names[e->level]);
 			draw_text(g, box_x + g->pad_x + lw, sy + (g->row_h - g->font->height) / 2,
