@@ -269,8 +269,8 @@ right of the picker.
 The palette is a single table at the top of `timegrid.c` giving each entry a
 `key` (what the file calls it, and it must stay stable), a `label` (what the
 panel calls it, free to change) and a compiled-in default. **`COL_WRITTEN`,
-`COL_RED` and `COL_BLUE` must stay adjacent and in that order** — cell colours
-are looked up as `COL_WRITTEN + CELL_PLAIN/RED/BLUE`.
+`COL_RED`, `COL_BLUE` and `COL_MIXED` must stay adjacent and in that order** —
+cell colours are looked up as `COL_WRITTEN + CELL_PLAIN/RED/BLUE/MIXED`.
 
 #### The themes list is a column, not a tail
 
@@ -700,13 +700,22 @@ April, and the text appears in March because that is where the week starts.
 Overlap is the rule, not containment. Do not "simplify" this to a parent/child
 tree; it will be wrong at the week/month boundary.
 
-Colour when several entries share a cell: a single chromatic colour wins, red
-and blue together cancel to the plain "written" shade. **This reading was
-inferred, not confirmed** — the instruction said the aggregate should take the
-colour of the written cell "unless literally all the cells are red, blue, or
-without writing, in which case it should be the default", which contradicts the
-worked example given in the same message (all-blue must aggregate to blue). The
-example was treated as authoritative. Worth confirming.
+Colour when several entries share a cell: a single chromatic colour wins, and
+red and blue together are **`CELL_MIXED`**, a palette entry of its own.
+
+They used to cancel to the plain "written" shade — that reading was inferred
+rather than confirmed, and the user has since ruled the other way: cancelling
+lost the fact that anything chromatic was in the cell at all, which is exactly
+what you want to see when zoomed out.
+
+`CELL_MIXED` is **display-only**. `cell_gather` can report it; an entry can
+never hold it, it is never written to the file, and `color_names` still has
+three members — which is why the alt-click cycle is still `% 3`. Keep that
+split: the moment mixed becomes storable, the file format and the cycle both
+have to grow.
+
+Note the all-blue example from the original instruction still holds — a single
+chromatic colour wins outright, mixed needs both.
 
 Text fitting has two halves, and the split matters:
 
@@ -725,6 +734,48 @@ dropped; that is fine for labels and for the short notes cells usually hold, but
 if a row of long notes ever makes redraws feel slow when zoomed out, that loop is
 where the time goes and a proportional first guess would cut it to a couple of
 passes.
+
+### The count of what you cannot see
+
+An aggregated cell used to look exactly like a cell that simply has that text in
+it. Nothing said the zoom was hiding anything, so the only way to find out was
+to zoom in and look. `cell_gather` therefore also reports `extra`: how many
+contributing entries are **not at the display level**, drawn as a small dim
+number in the cell's left margin.
+
+At most one entry can sit at the display level — same level and same bucket
+means the same entry — so `extra` is exactly "everything beyond the cell's own
+content", and it needs no second pass to work that out.
+
+It counts **coarser entries as well as finer ones**, which is the reading to
+know about: a month-long block seen at day zoom shows a `1` in every day it
+covers, including the first, where its text does show. That is deliberate — the
+day cell really is displaying something written at another resolution, and the
+alternative (suppressing it in the cell that holds the text) makes the number
+mean two different things depending on where you look. Both are tested; if it
+proves noisy in use, the change is one condition in `cell_gather`.
+
+The number takes its width off the text beside it rather than overlapping it. A
+truncated note can be recovered by zooming in; a hidden count cannot.
+
+### Editing a cell shows its other resolutions
+
+Editing only ever showed the cell's *own* text, so writing at a finer resolution
+inside the same span was invisible until you abandoned the edit and went hunting
+for it. The edit box now opens the neighbourhood out around itself: everything
+else in that span at another level, **coarser above, finer below**, each strip
+naming its level so the shape is readable at a glance.
+
+They are read-only and drawn in the edit colour with a plain outline — this is a
+look, not a second edit. The entries come out of `entry_cmp` order, so each side
+reads in time order. A side that runs out of window simply stops rather than
+drawing off the edge; the count in the cell is still the honest total.
+
+This is why the whole edit-box block now draws **after** the grid's clip
+rectangle is released, and after the row names, rather than in the middle of the
+cell pass: the strips below can reach past the last row. It is an overlay, and
+overlays go last — the same reasoning as the colours panel. It also means the
+box now sits on top of the horizontal row lines instead of under them.
 
 `cell_gather` deliberately does no text measurement so the whole model is
 testable without an X connection — `cell_text` does the fitting. Keep that
@@ -926,7 +977,11 @@ and the window fitting the screen even with `MAX_ROWS` rows. The hidden-rows
 list fits the same way: a short widget opening it in place, a tall one floating
 it with every name on screen and the colours control still reachable below,
 both floating together stacking rather than overlapping, a closed list never
-being clamped, and the sliders staying clear at `MAX_ROWS`. The themes column
+being clamped, and the sliders staying clear at `MAX_ROWS`. The cell aggregate
+too: red and blue voting to mixed while all-blue still votes blue, mixed landing
+on its own palette slot, the alt-click cycle staying inside the three storable
+colours, and `extra` counting finer and coarser entries while never counting the
+cell's own. The themes column
 too: the panel's height not moving with the theme count, the column clearing the
 picker and starting level with its top, items running down it and wrapping into
 the next one, every item landing inside the window, the hit test finding the item

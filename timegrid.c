@@ -65,13 +65,13 @@ static const char *plans_path = "assets/notebooks/notemaster/202607/plans.q";
  * `key` is what the file calls it and must stay stable; `label` is what the
  * panel calls it and is free to change.
  *
- * COL_WRITTEN, COL_RED and COL_BLUE must stay adjacent and in that order: cell
- * colours are looked up as COL_WRITTEN + CELL_PLAIN/RED/BLUE. */
+ * COL_WRITTEN, COL_RED, COL_BLUE and COL_MIXED must stay adjacent and in that
+ * order: cell colours are looked up as COL_WRITTEN + CELL_PLAIN/RED/BLUE/MIXED. */
 enum {
 	COL_BG, COL_FG, COL_DIM, COL_LINE, COL_GUTTER, COL_HEADER,
 	COL_NOW_HEAD, COL_NOW_BODY, COL_NOW_EDGE,
 	COL_TRACK, COL_KNOB,
-	COL_WRITTEN, COL_RED, COL_BLUE,
+	COL_WRITTEN, COL_RED, COL_BLUE, COL_MIXED,
 	COL_SELECT, COL_EDIT, COL_COUNT
 };
 
@@ -94,6 +94,7 @@ static const struct {
 	{ "written",  "written cell", "2f2f2f" },  /* has content, no colour */
 	{ "red",      "red cell",     "5a2222" },
 	{ "blue",     "blue cell",    "1e3a5f" },
+	{ "mixed",    "mixed cell",   "452a55" },  /* red and blue in one cell */
 	{ "select",   "selection",    "e0b040" },  /* shift-drag outline */
 	{ "edit",     "cell edit",    "26343d" },  /* the box being typed into */
 };
@@ -149,7 +150,11 @@ static const int context_of[LVL_COUNT] = {
 enum { DRAG_NONE, DRAG_GRID, DRAG_ZOOM, DRAG_POS, DRAG_SIZE, DRAG_SELECT,
        DRAG_ROW, DRAG_COLOR, DRAG_SHIFT };
 enum { EDIT_NONE, EDIT_ROW, EDIT_CELL, EDIT_THEME };
-enum { CELL_PLAIN, CELL_RED, CELL_BLUE };   /* order is the alt-click cycle */
+/* The first three are the alt-click cycle and the only ones an entry can hold.
+ * CELL_MIXED is display-only: cell_gather reports it when red and blue land in
+ * the same cell, and it is never stored or written to the file — which is why
+ * the cycle stays `% 3`. */
+enum { CELL_PLAIN, CELL_RED, CELL_BLUE, CELL_MIXED };
 
 static const char *level_names[LVL_COUNT] = {
 	"5m", "15m", "1h", "6h", "day", "week", "month", "year"
@@ -1347,21 +1352,31 @@ selection_set_color(struct grid *g)
 
 /* What one display cell holds, given that entries may be coarser than the
  * current zoom (expand), finer (aggregate), or exactly on it. Returns the
- * number of text pieces, in time order, and reports the cell's colour.
+ * number of text pieces, in time order, and reports the cell's colour and how
+ * many contributing entries are not at the display level.
  *
- * Colour votes: a single chromatic colour wins; red and blue together cancel
- * to the plain "written" shade, because there is no sensible blend.
+ * Colour votes: a single chromatic colour wins; red and blue together are
+ * CELL_MIXED, a colour of its own. They used to cancel to the plain "written"
+ * shade, which lost the fact that anything chromatic was there at all.
+ *
+ * `extra` counts entries at any level but `level` — the ones whose writing you
+ * cannot fully see here, because they were aggregated into this cell from finer
+ * ones or expanded into it from a coarser one. At most one entry can sit at the
+ * display level (same level and same bucket means the same entry), so this is
+ * also "everything beyond the cell's own content".
  *
  * Deliberately does no text measurement, so the whole aggregate/expand model
  * is testable without an X connection. Fitting is cell_text's job. */
 static int
-cell_gather(struct grid *g, int row, time_t t, time_t t_next,
-            int *color, int *filled, const char *pieces[], int max_pieces)
+cell_gather(struct grid *g, int row, time_t t, time_t t_next, int level,
+            int *color, int *filled, int *extra, const char *pieces[],
+            int max_pieces)
 {
 	int i, count = 0, has_red = 0, has_blue = 0;
 
 	*color = CELL_PLAIN;
 	*filled = 0;
+	*extra = 0;
 
 	for (i = 0; i < g->entry_count; i++) {
 		struct entry *e = &g->entries[i];
@@ -1375,6 +1390,9 @@ cell_gather(struct grid *g, int row, time_t t, time_t t_next,
 			continue;   /* span does not reach this cell */
 		}
 		*filled = 1;
+		if (e->level != level) {
+			(*extra)++;
+		}
 		if (e->color == CELL_RED) {
 			has_red = 1;
 		}
@@ -1389,9 +1407,11 @@ cell_gather(struct grid *g, int row, time_t t, time_t t_next,
 			pieces[count++] = e->text;
 		}
 	}
-	if (has_red && !has_blue) {
+	if (has_red && has_blue) {
+		*color = CELL_MIXED;
+	} else if (has_red) {
 		*color = CELL_RED;
-	} else if (has_blue && !has_red) {
+	} else if (has_blue) {
 		*color = CELL_BLUE;
 	}
 	return count;
@@ -1787,24 +1807,41 @@ redraw(struct grid *g)
 
 		for (vis = 0; vis < g->visible_count; vis++) {
 			const char *pieces[MAX_PIECES];
-			char cell[MAX_LABEL];
-			int cell_color, cell_filled, piece_count;
+			char cell[MAX_LABEL], count[16];
+			int cell_color, cell_filled, extra, piece_count;
 			int cy = g->margin_top + g->context_h + g->row_h * (vis + 1);
+			int tx = (int)x + g->pad_x, tw = (int)(nx - x) - g->pad_x * 2;
+			int ty = cy + (g->row_h - g->font->height) / 2;
 
 			row = g->visible[vis];
-			piece_count = cell_gather(g, row, t, next, &cell_color,
-			                          &cell_filled, pieces, MAX_PIECES);
+			piece_count = cell_gather(g, row, t, next, level, &cell_color,
+			                          &cell_filled, &extra, pieces, MAX_PIECES);
 			if (!cell_filled) {
 				continue;
 			}
-			cell_text(g, pieces, piece_count, (int)(nx - x) - g->pad_x * 2,
-			          cell, sizeof cell);
 			XSetForeground(g->dpy, g->gc, g->col[COL_WRITTEN + cell_color].pixel);
 			XFillRectangle(g->dpy, g->buf, g->gc, (int)x + 1, cy + 1,
 			               (int)(nx - x) - 1, g->row_h - 1);
-			if (cell[0] != '\0') {
-				draw_text(g, (int)x + g->pad_x, cy + (g->row_h - g->font->height) / 2,
-				          (int)(nx - x) - g->pad_x * 2, COL_FG, cell);
+
+			/* A count of what is in the cell at some other resolution, in the
+			 * left margin. Without it an aggregated cell looks like a cell that
+			 * simply has that text in it, and there is nothing to say the zoom
+			 * is hiding anything. It takes its width off the text beside it
+			 * rather than overlapping — a truncated note is recoverable by
+			 * zooming, a hidden count is not. */
+			if (extra > 0) {
+				XGlyphInfo ext;
+
+				snprintf(count, sizeof count, "%d", extra);
+				XftTextExtentsUtf8(g->dpy, font_for(g, COL_DIM), (FcChar8 *)count,
+				                   (int)strlen(count), &ext);
+				draw_text(g, tx, ty, tw, COL_DIM, count);
+				tx += ext.xOff + g->pad_x;
+				tw -= ext.xOff + g->pad_x;
+			}
+			cell_text(g, pieces, piece_count, tw, cell, sizeof cell);
+			if (cell[0] != '\0' && tw > 0) {
+				draw_text(g, tx, ty, tw, COL_FG, cell);
 			}
 		}
 
@@ -1845,48 +1882,6 @@ redraw(struct grid *g)
 		               (int)(nx - x), g->row_h * (v1 - v0 + 1));
 	}
 
-	/* The cell being typed into, drawn over whatever it currently holds.
-	 *
-	 * The box is as wide as the cell or as wide as what is being typed,
-	 * whichever is more, and it slides left off the right edge rather than
-	 * clipping. Editing is the one moment the whole text has to be readable —
-	 * a narrow column at a coarse zoom would otherwise hide the end of the
-	 * word as you write it. It overlaps the cells to its right while open;
-	 * they are redrawn on commit. */
-	if (g->edit_mode == EDIT_CELL && row_visible_index(g, g->edit_row) >= 0) {
-		XGlyphInfo ext;
-		int cy = g->margin_top + g->context_h +
-		         g->row_h * (row_visible_index(g, g->edit_row) + 1);
-		int box_x, box_w;
-
-		x = pixel_at_time(g, (double)g->edit_start);
-		nx = pixel_at_time(g, (double)bucket_step(g->edit_start, g->edit_level, +1));
-		XftTextExtentsUtf8(g->dpy, font_for(g, COL_FG), (FcChar8 *)g->input,
-		                   g->input_len, &ext);
-		box_x = (int)x + 1;
-		box_w = (int)(nx - x) - 1;
-		if (ext.xOff + g->pad_x * 2 + 2 > box_w) {
-			box_w = ext.xOff + g->pad_x * 2 + 2;
-		}
-		if (box_x + box_w > g->w) {
-			box_x = g->w - box_w;
-		}
-		if (box_x < g->gutter_w) {
-			box_x = g->gutter_w;
-		}
-		XSetForeground(g->dpy, g->gc, g->col[COL_EDIT].pixel);
-		XFillRectangle(g->dpy, g->buf, g->gc, box_x, cy + 1, box_w, g->row_h - 1);
-		/* Outlined because it can now cover its neighbours — without an edge
-		 * there is nothing to say where the box being typed into ends. */
-		XSetForeground(g->dpy, g->gc, g->col[COL_SELECT].pixel);
-		XDrawRectangle(g->dpy, g->buf, g->gc, box_x, cy + 1, box_w - 1, g->row_h - 2);
-		draw_text(g, box_x + g->pad_x, cy + (g->row_h - g->font->height) / 2,
-		          box_w - g->pad_x * 2, COL_FG, g->input);
-		XSetForeground(g->dpy, g->gc, g->col[COL_NOW_EDGE].pixel);
-		XFillRectangle(g->dpy, g->buf, g->gc, box_x + g->pad_x + ext.xOff + 1,
-		               cy + 4, 1, g->row_h - 8);
-	}
-
 	/* The exact instant, on top of its highlighted bucket. Read at draw time
 	 * rather than tracked — there is no timer, so it is accurate as of the
 	 * last interaction, which is enough. */
@@ -1924,6 +1919,108 @@ redraw(struct grid *g)
 		          (g->drag == DRAG_ROW || g->drag == DRAG_SHIFT) &&
 		          row == g->drag_row ? COL_FG : COL_DIM,
 		          g->rows[row]);
+	}
+
+	/* The cell being typed into, drawn over whatever it currently holds.
+	 *
+	 * The box is as wide as the cell or as wide as what is being typed,
+	 * whichever is more, and it slides left off the right edge rather than
+	 * clipping. Editing is the one moment the whole text has to be readable —
+	 * a narrow column at a coarse zoom would otherwise hide the end of the
+	 * word as you write it. It overlaps the cells to its right while open;
+	 * they are redrawn on commit.
+	 *
+	 * Drawn outside the grid's clip rectangle, and after it, because the
+	 * strips below open downwards and may reach past the last row. It is an
+	 * overlay, like the colours panel — the same reasoning puts it last. */
+	if (g->edit_mode == EDIT_CELL && row_visible_index(g, g->edit_row) >= 0) {
+		XGlyphInfo ext;
+		int cy = g->margin_top + g->context_h +
+		         g->row_h * (row_visible_index(g, g->edit_row) + 1);
+		int box_x, box_w, i, above = 0, below = 0;
+		int top_limit = g->margin_top + g->context_h + g->row_h;
+		time_t span_end = bucket_step(g->edit_start, g->edit_level, +1);
+
+		x = pixel_at_time(g, (double)g->edit_start);
+		nx = pixel_at_time(g, (double)span_end);
+		XftTextExtentsUtf8(g->dpy, font_for(g, COL_FG), (FcChar8 *)g->input,
+		                   g->input_len, &ext);
+		box_x = (int)x + 1;
+		box_w = (int)(nx - x) - 1;
+		if (ext.xOff + g->pad_x * 2 + 2 > box_w) {
+			box_w = ext.xOff + g->pad_x * 2 + 2;
+		}
+		if (box_x + box_w > g->w) {
+			box_x = g->w - box_w;
+		}
+		if (box_x < g->gutter_w) {
+			box_x = g->gutter_w;
+		}
+
+		/* Everything else written inside this cell's span, at some other
+		 * resolution, opened out around the box: coarser above, finer below.
+		 * A cell aggregating finer writing used to show only its own text
+		 * while being edited, so the rest of what was in there could only be
+		 * found by abandoning the edit and zooming in to hunt for it.
+		 *
+		 * Read-only, and drawn dim: this is a look at the neighbourhood, not a
+		 * second edit. Ordered by entry_cmp, so each side reads in time order.
+		 *
+		 * A side that runs out of window simply stops. The count in the cell
+		 * is the honest total, and it is still there underneath the box. */
+		for (i = 0; i < g->entry_count; i++) {
+			const struct entry *e = &g->entries[i];
+			int sy, lw;
+			XGlyphInfo lext;
+
+			if (e->row != g->edit_row || e->level == g->edit_level ||
+			    e->text[0] == '\0') {
+				continue;
+			}
+			if (bucket_step(e->start, e->level, +1) <= g->edit_start ||
+			    e->start >= span_end) {
+				continue;
+			}
+			if (e->level > g->edit_level) {
+				sy = cy - g->row_h * (above + 1);
+				if (sy < top_limit) {
+					continue;
+				}
+				above++;
+			} else {
+				sy = cy + g->row_h * (below + 1);
+				if (sy + g->row_h > g->h) {
+					continue;
+				}
+				below++;
+			}
+			XSetForeground(g->dpy, g->gc, g->col[COL_EDIT].pixel);
+			XFillRectangle(g->dpy, g->buf, g->gc, box_x, sy + 1, box_w, g->row_h - 1);
+			XSetForeground(g->dpy, g->gc, g->col[COL_LINE].pixel);
+			XDrawRectangle(g->dpy, g->buf, g->gc, box_x, sy + 1, box_w - 1, g->row_h - 2);
+			/* The level is named because it is the whole point of the strip:
+			 * "there is an hour's worth of writing inside this day". */
+			XftTextExtentsUtf8(g->dpy, font_for(g, COL_DIM),
+			                   (FcChar8 *)level_names[e->level],
+			                   (int)strlen(level_names[e->level]), &lext);
+			lw = lext.xOff + g->pad_x;
+			draw_text(g, box_x + g->pad_x, sy + (g->row_h - g->font->height) / 2,
+			          box_w - g->pad_x * 2, COL_DIM, level_names[e->level]);
+			draw_text(g, box_x + g->pad_x + lw, sy + (g->row_h - g->font->height) / 2,
+			          box_w - g->pad_x * 2 - lw, COL_FG, e->text);
+		}
+
+		XSetForeground(g->dpy, g->gc, g->col[COL_EDIT].pixel);
+		XFillRectangle(g->dpy, g->buf, g->gc, box_x, cy + 1, box_w, g->row_h - 1);
+		/* Outlined because it can now cover its neighbours — without an edge
+		 * there is nothing to say where the box being typed into ends. */
+		XSetForeground(g->dpy, g->gc, g->col[COL_SELECT].pixel);
+		XDrawRectangle(g->dpy, g->buf, g->gc, box_x, cy + 1, box_w - 1, g->row_h - 2);
+		draw_text(g, box_x + g->pad_x, cy + (g->row_h - g->font->height) / 2,
+		          box_w - g->pad_x * 2, COL_FG, g->input);
+		XSetForeground(g->dpy, g->gc, g->col[COL_NOW_EDGE].pixel);
+		XFillRectangle(g->dpy, g->buf, g->gc, box_x + g->pad_x + ext.xOff + 1,
+		               cy + 4, 1, g->row_h - 8);
 	}
 
 	/* The "+" row sits below the grid proper — no columns run through it, so
