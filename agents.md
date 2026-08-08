@@ -300,7 +300,10 @@ the window width inside `themes_item_rect` and the hit test follows on its own.
 Both controls below the grid grow downwards, and with enough rows above them
 they grew off the bottom of the monitor — a control you cannot click is a
 control you do not have. Two mechanisms, in this order, and both are worth
-keeping because they cover different cases:
+keeping because they cover different cases. They apply to the **hidden-rows
+list** as well as to the colours panel, by the same code: `hidden_row_y` is the
+same shape as `colors_row_y` and the two chain, the second measuring from the
+first.
 
 1. **The window slides up.** `window_fit` sets `win_top` from the fitted height:
    normally `win_y`, but `screen_h - h` when that would overshoot the bottom
@@ -320,6 +323,18 @@ Because the draw pass, the hit test and the window height all derive from
 it lands. Rows underneath a floating panel are not clickable while it is open;
 the colours branch of the hit test is checked before the grid, which is the
 right way round for an overlay.
+
+The hidden-rows list needed the second mechanism too and now has it, in
+`hidden_row_y`. Mechanism 1 alone did not cover it: expanding the list with a
+screenful of rows above it pushed the names off the bottom edge, and there was
+no upward room left for `window_fit` to find. It clamps only while the list is
+**open** — a closed header is one row and stays where the rows put it — and the
+room it keeps below itself is `row_h * (2 + hidden_count)`, plus
+`picker_panel_h` when the panel is open. That last part is what makes the two
+floats agree: `colors_row_y` adds `row_h * (1 + hidden_count)` back on, so when
+both float they land stacked against the bottom edge rather than on top of each
+other. An open list paints its own band and top edge for the same reason the
+panel does, and its hit-test branch moved ahead of the rows.
 
 Two supporting rearrangements:
 
@@ -907,7 +922,11 @@ header like any other colour. Panel fitting too: a short widget staying at
 `win_y` with the panel opening in place, a tall one sliding up until its last row
 sits on the screen edge, a closed panel never being clamped, an open one floating
 over the rows with its themes list still on screen and the sliders still clear,
-and the window fitting the screen even with `MAX_ROWS` rows. The themes column
+and the window fitting the screen even with `MAX_ROWS` rows. The hidden-rows
+list fits the same way: a short widget opening it in place, a tall one floating
+it with every name on screen and the colours control still reachable below,
+both floating together stacking rather than overlapping, a closed list never
+being clamped, and the sliders staying clear at `MAX_ROWS`. The themes column
 too: the panel's height not moving with the theme count, the column clearing the
 picker and starting level with its top, items running down it and wrapping into
 the next one, every item landing inside the window, the hit test finding the item

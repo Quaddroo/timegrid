@@ -1567,6 +1567,36 @@ picker_panel_h(struct grid *g)
 	return g->row_h * 2 + picker_height(&g->picker) + g->pad_x * 2;
 }
 
+/* y of the "hidden rows" control, which sits under "+ add row". The names run
+ * below it while the list is open.
+ *
+ * It floats for the same reason the colours panel does, and by the same
+ * arithmetic: once the rows fill the screen there is no upward room left for
+ * window_fit to find, so the list stops being pushed down and is drawn over the
+ * bottom rows instead. Room is kept below it for whatever still has to sit
+ * there — the colours control, and its panel when that is open — so when both
+ * float they stack against the bottom edge rather than over each other. */
+static int
+hidden_row_y(struct grid *g)
+{
+	/* Date row, the visible rows, then the "+" row. */
+	int y = g->margin_top + g->context_h + g->row_h * (g->visible_count + 2);
+
+	if (g->menu_open && g->hidden_count > 0) {
+		int below = g->row_h * (2 + g->hidden_count);
+		int max_y;
+
+		if (g->picker_open) {
+			below += picker_panel_h(g);
+		}
+		max_y = g->screen_h - below;
+		if (y > max_y) {
+			y = max_y > g->margin_top ? max_y : g->margin_top;
+		}
+	}
+	return y;
+}
+
 /* y of the colours control, which sits under "+ add row" and under the hidden
  * rows list when that is open. The draw pass, the hit test and the window
  * height all derive from this one function so they cannot drift apart — which
@@ -1574,8 +1604,7 @@ picker_panel_h(struct grid *g)
 static int
 colors_row_y(struct grid *g)
 {
-	/* Date row, the visible rows, then the "+" row. */
-	int y = g->margin_top + g->context_h + g->row_h * (g->visible_count + 2);
+	int y = hidden_row_y(g);
 
 	if (g->hidden_count > 0) {
 		y += g->row_h;   /* the "hidden rows" control */
@@ -1917,21 +1946,32 @@ redraw(struct grid *g)
 
 	/* The hidden rows control, below "+", and only when there is something to
 	 * list. Same visual language as "+  add row" so it reads as a control:
-	 * "+" opens, "-" closes, and the names sit indented beneath. */
+	 * "+" opens, "-" closes, and the names sit indented beneath.
+	 *
+	 * Like the colours panel it floats over the bottom rows when there is no
+	 * room left below them, so an open list paints its own band and top edge —
+	 * a no-op in the usual case, where there is nothing under it anyway. */
 	if (g->hidden_count > 0) {
 		char item[MAX_LABEL + 32];
-		int i, listed = 0;
+		int i, listed = 0, top = hidden_row_y(g);
 
+		if (g->menu_open) {
+			XSetForeground(g->dpy, g->gc, g->col[COL_BG].pixel);
+			XFillRectangle(g->dpy, g->buf, g->gc, 0, top, g->w,
+			               g->row_h * (1 + g->hidden_count));
+			XSetForeground(g->dpy, g->gc, g->col[COL_LINE].pixel);
+			XDrawLine(g->dpy, g->buf, g->gc, 0, top, g->w, top);
+		}
 		snprintf(item, sizeof item, "%s  hidden rows (%d)",
 		         g->menu_open ? "-" : "+", g->hidden_count);
-		draw_text(g, g->pad_x, bottom + g->row_h + (g->row_h - g->font->height) / 2,
+		draw_text(g, g->pad_x, top + (g->row_h - g->font->height) / 2,
 		          g->w - g->pad_x * 2, COL_DIM, item);
 
 		for (i = 0; g->menu_open && i < g->row_count; i++) {
 			if (!g->row_hidden[i]) {
 				continue;
 			}
-			y = bottom + g->row_h * (2 + listed) + (g->row_h - g->font->height) / 2;
+			y = top + g->row_h * (1 + listed) + (g->row_h - g->font->height) / 2;
 			draw_text(g, g->pad_x * 4, y, g->w - g->pad_x * 5, COL_FG, g->rows[i]);
 			listed++;
 		}
@@ -2362,12 +2402,13 @@ main(int argc, char *argv[])
 						g.drag = DRAG_COLOR;
 					}
 					dirty = 1;
-				} else if (ev.xbutton.y >= bottom + g.row_h &&
-				           g.hidden_count > 0) {
-					/* The hidden rows control: row 0 below "+" is the header
+				} else if (g.hidden_count > 0 &&
+				           ev.xbutton.y >= hidden_row_y(&g)) {
+					/* The hidden rows control: its first row is the header
 					 * and toggles the list, the rows under it are the names,
-					 * and clicking one puts that row back. */
-					int item = (ev.xbutton.y - bottom) / g.row_h - 1;
+					 * and clicking one puts that row back. Checked before the
+					 * rows because an open list floats over them. */
+					int item = (ev.xbutton.y - hidden_row_y(&g)) / g.row_h;
 
 					if (item == 0) {
 						g.menu_open = !g.menu_open;
