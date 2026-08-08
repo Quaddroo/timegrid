@@ -31,6 +31,14 @@ rolling backlog" is moot — the answer was neither; it is a timeline, and the
 zoom range decides how much you see. The layout is answered. And cells hold
 free text plus an optional colour, at whatever resolution they were written.
 
+Closed since: **what red and blue do when they land in the same cell.** They no
+longer cancel; they make a third colour. That does not answer what red and blue
+*mean*, which is still open above — only what the display does with both at
+once. And a coarse cell aggregating finer ones now says so, with a count and,
+while it is being edited, the finer cells themselves — so "does a coarse write
+replace the finer ones" is less pressing than it was, because coexisting is no
+longer invisible.
+
 ## The problem, stated properly
 
 The user runs dwm. There is no desktop. In X11 the background is the root
@@ -271,6 +279,16 @@ The palette is a single table at the top of `timegrid.c` giving each entry a
 panel calls it, free to change) and a compiled-in default. **`COL_WRITTEN`,
 `COL_RED`, `COL_BLUE` and `COL_MIXED` must stay adjacent and in that order** —
 cell colours are looked up as `COL_WRITTEN + CELL_PLAIN/RED/BLUE/MIXED`.
+
+**Adding a palette entry is safe in the middle of the table**, which is not
+obvious and is worth knowing before anyone appends one to the end to be careful.
+Everything persisted — the plans header, the themes file — is keyed by `key`,
+never by index, so inserting shifts nothing on disk and an older file simply
+leaves the new entry at its default. Everything laid out — the swatch strip,
+`bold_toggle_x` — is derived from `COL_COUNT`, so it widens on its own. The only
+constraint is the adjacency above. `COL_MIXED` went in beside its siblings for
+exactly this reason, rather than at the end where it would have read as
+unrelated.
 
 #### The themes list is a column, not a tail
 
@@ -527,7 +545,15 @@ the wider of the cell and the text in it, outlined so its extent is visible
 where it covers the cells to its right, and it slides left rather than running
 off the right edge of the window. Display clipping is right for a cell you are
 only reading — the words you are typing are the one case where the whole string
-has to be legible whatever the zoom. Alt-click cycles
+has to be legible whatever the zoom.
+
+It is no longer only the one cell: a cell that aggregates writing from other
+resolutions opens those out around the box while you edit, and carries a count
+of them when you are not. Both live under "Editing a cell shows its other
+resolutions" below, and the two must agree — that pairing has been the source of
+every bug this feature has had, and it is worth reading before touching either.
+
+Alt-click cycles
 its colour, plain → red → blue → plain, keeping whatever text is there. A cell
 with neither text nor colour is not an entry at all, so clearing both deletes
 it rather than leaving a husk in the file.
@@ -951,6 +977,40 @@ The parts that sound hard — event loop, focus, screensaver hookup — are
 genuinely small and written once. The bulk is boring rather than difficult, and
 stays boring only as long as the file format stays simple.
 
+## The draw pass has an order, and it is load-bearing
+
+`redraw` is one long function on purpose, but its sequence is not arbitrary.
+Left to right in time:
+
+1. **Inside the grid's clip rectangle** — the now-fill, then the column loop
+   (cells, grid lines, bucket labels, context labels), then the selection
+   rectangle and the now-hairline. Everything here is *content*, and the clip
+   is what keeps a scrolling column off the gutter and out of the margins.
+2. **`XSetClipMask(None)` / `XftDrawSetClip(None)`** — the boundary.
+3. **Frame and gutter** — the vertical gutter rule, the horizontal row lines,
+   "Date", the row names. Drawn after the cells so the lines sit on top of
+   them.
+4. **Overlays** — the edit box and its stack, then "+ add row", the hidden-rows
+   list, then the colours control and its panel.
+
+Two rules fall out, and both have already been learned the hard way:
+
+- **An overlay goes after the clip is released**, because an overlay is allowed
+  to leave the grid. The edit stack opens downwards and can reach past the last
+  row; the hidden-rows list and the colours panel float up over the rows. All
+  three would be clipped or cut off if they were drawn where their content
+  lives.
+- **Overlay draw order and hit-test order must be mirror images.** The draw
+  pass paints later-over-earlier; the hit test is an else-if chain that must
+  therefore check later-drawn things *first*. The colours branch is tested
+  before the hidden-rows branch because it is painted after it, and both are
+  tested before the grid rows. Get this backwards and clicks land on whatever
+  is underneath the thing the user is looking at.
+
+Moving something between phases 1 and 3–4 is a real change, not a tidy-up: the
+edit box moved from phase 1 to phase 4 and now draws *over* the horizontal row
+lines instead of under them.
+
 ## Hit-testing
 
 Fill a flat array of `{x, y, w, h, item_id}` during the draw pass, linear scan
@@ -1053,15 +1113,48 @@ the next one, every item landing inside the window, the hit test finding the ite
 that was drawn, and a slot past the last theme not being clickable. Those run against temp paths and never touch the
 real notebook.
 
-It is not committed anywhere permanent — rebuild it when needed. Two traps
-worth knowing if you write more of it, both of which produced false passes:
+It is not committed anywhere permanent — rebuild it when needed. Four traps
+worth knowing if you write more of it. The first two produced false passes; the
+third produces a segfault before the first assertion runs:
 
 - Simulating elapsed time by winding the clock back a full second trips the
   0.5s deschedule guard, so the shuttle correctly does nothing and any
   assertion comparing two zero displacements passes trivially. Use ~100ms.
 - `shuttle_advance` reads the clock itself, so simulated `dt` carries real
   microsecond jitter. Compare rates with a relative tolerance, not exactly.
+- **Do not call `layout_apply` in a test.** It opens a font, so it needs a
+  display, and without one it walks a NULL `g->font`. For the fitting maths, set
+  `row_h`, `pad_x`, `context_h`, `margin_top`, `screen_h` and the five
+  `g->picker` size fields by hand — none of that arithmetic cares where the
+  numbers came from, and a round `row_h` makes the expected values readable.
+- The harness must `#include "timegrid.c"` with `main` renamed and be compiled
+  with `-I.` from the project directory; it links `picker.o` rather than
+  including `picker.c`, which the colour-space harness does instead.
 
 What the harness cannot check is whether any of it *looks* right. Colour
 balance, margins and knob sizes have only ever been verified by the user
 looking at the screen.
+
+### Finding a display bug: print the model, do not re-read the draw pass
+
+Twice now a report has been of the form "sometimes the wrong thing appears in
+this cell", and both times the instinct to re-read the drawing code was wrong —
+the drawing was correct in both, and the fault was in what it had been handed.
+
+What worked, and should be the first move next time: write a throwaway `main`
+that builds the entries the user's file would hold, calls the *gather* function,
+and prints what came back. The bug is visible in one line of output. The second
+of the two was found this way in a couple of minutes after a long, fruitless
+stare at `XFillRectangle` coordinates.
+
+This is the practical payoff of the gather/draw split that `cell_gather`,
+`edit_stack_gather` and `cell_text` are built around, and the reason to keep
+extending it rather than doing model work inside the draw pass. **When adding
+anything that decides *what* appears on screen, put the decision in a function
+that takes no `Display` and returns data.** Then it is printable, and it is
+testable on a machine with no X server at all.
+
+A corollary about the reports themselves: a symptom described in terms of
+colour ("the strip lost its colour") can turn out to be an entry-selection bug,
+because the wrong entry was drawn correctly. Do not narrow to the code that
+handles the noun in the report.
